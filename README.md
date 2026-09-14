@@ -1,126 +1,144 @@
-# 🌐 Self-Hosting My Infrastructure on Raspberry Pi 5 — No Port Forwarding
+# Architecture & Build Plan
 
-## What I Built
-
-What started as just my personal website has grown into a small home-hosted infrastructure running on a single **Raspberry Pi 5** — no port forwarding, no static IP, no paid hosting. Everything is exposed to the internet through **Cloudflare Tunnel**, split across two domains by purpose:
-
-| Domain | Purpose | Service |
-|---|---|---|
-| `raunakkushwaha.me` | Public portfolio site | Nginx |
-| `drive.raunakkushwaha.tech` | Private personal file drive | Filestash (Docker) + OnlyOffice preview |
-| `movies.raunakkushwaha.tech` | Private movie streaming server | Jellyfin |
-
-The private services (`drive`, `movies`) sit behind two layers of auth: their own app-level login, plus a Cloudflare Access email allowlist in front of the tunnel itself.
-
-> Older versions of this repo covered only the `raunakkushwaha.tech` portfolio site on a single tunnel. That domain now serves the private drive + movies, and the portfolio moved to `raunakkushwaha.me`.
-
----
-
-## Architecture
+## 1. System Architecture (word diagram)
 
 ```
-                         ┌──────────────────────────┐
-Visitor ──────────────▶  │   Cloudflare Network      │
-                         │  (+ Access, for private   │
-                         │   hostnames only)         │
-                         └──────────────┬────────────┘
-                                        │ encrypted tunnel (cloudflared)
-                                        ▼
-                         ┌──────────────────────────────────┐
-                         │        Raspberry Pi 5              │
-                         │  cloudflared (single tunnel,        │
-                         │  multiple ingress rules)             │
-                         ├──────────────┬───────────┬─────────┤
-                         │  Nginx :80   │ Filestash  │ Jellyfin │
-                         │  (portfolio) │  :8080     │  :8096   │
-                         │              │  + OnlyOffice :8081   │
-                         └──────────────┴───────────┴─────────┘
+Client domains (200x) ──┐
+Demo subpaths ───────────┤
+                          ▼
+              Cloudflare DNS (per-zone or per-domain CNAME → your tunnel)
+                          │
+                          ▼
+              Cloudflare Tunnel (cloudflared, single process)
+                          │
+                          ▼
+              Nginx (single instance, port 80/443 internally)
+              ├── server block per domain (or wildcard + dynamic root)
+              └── each root → /srv/sites/<client-slug>/
+                          │
+                          ▼
+              Static files only (HTML/CSS/JS, no per-site backend process)
 ```
 
-One cloudflared tunnel (`raunak-pi-me`) routes all three hostnames to their respective local ports via `ingress` rules — no separate tunnel per service.
+Key decision: **everything stays static HTML/CSS/JS**. No per-client Node/PHP process, no per-client database. This is the single most important architectural constraint for hosting 200 sites on one Pi — a static file is nearly free to serve; a running process per client is not. Contact forms, "database features" for Full Custom tier get handled by:
 
----
+- **Contact forms** → a shared serverless form endpoint (Cloudflare Pages Functions, Formspree, or your own single Node microservice on the Pi that all sites POST to — one process serving all 200 sites, not 200 processes)
+- **"Database features" for Full Custom** → don't build custom backends per client. Use a shared multi-tenant service (one Node/Express + SQLite process, tenant_id column) so it's still one process regardless of client count.
 
-## Stack
+This is the difference between "200 websites" (cheap, static) and "200 web apps" (expensive, stateful) — sell Full Custom as "database-backed features," but implement it as one shared multi-tenant service behind the scenes.
 
-- **Hardware**: Raspberry Pi 5
-- **OS**: Raspberry Pi OS Lite (Debian Bookworm, ARM64)
-- **Tunnel**: Cloudflare Tunnel (`cloudflared`), single tunnel / multi-hostname ingress
-- **Portfolio**: Nginx
-- **Private drive**: [Filestash](https://github.com/mickael-kerjean/filestash) (Docker) — chosen over Filebrowser, which was flagged as archived/unmaintained
-- **Document preview**: OnlyOffice Docs Community Edition (Docker), integrated with Filestash via WOPI
-- **Media server**: Jellyfin (native install, not Docker)
-- **Access control**: Cloudflare Access (email allowlist) in front of both private hostnames, on top of each app's own login
+## 2. Nginx at 200 sites — don't hand-write 200 server blocks
 
----
+Use **one dynamic server block** with `map`-based routing instead of 200 separate files:
 
-## How It Works
+```nginx
+map $host $site_root {
+    default /srv/sites/_default;
+    include /etc/nginx/site-map.conf;   # generated file, one line per client
+}
 
+server {
+    listen 80;
+    server_name _;
+    root $site_root;
+    index index.html;
+    location / { try_files $uri $uri/ =404; }
+}
 ```
-Visitor → <hostname>
-        → Cloudflare's network (+ Access check for private hostnames)
-        → Encrypted tunnel (cloudflared)
-        → Raspberry Pi 5 → matching local port (80 / 8080 / 8096)
+
+`site-map.conf` is generated by a script:
 ```
+~restaurant-abc.com $site_root /srv/sites/restaurant-abc;
+~shop-xyz.com.np    $site_root /srv/sites/shop-xyz;
+```
+Adding a client = append one line + `nginx -s reload`. No restart, no downtime, no per-client file sprawl.
 
-Cloudflare Tunnel creates an outbound-only connection from the Pi to Cloudflare, so no ports are opened on the router and the home IP stays hidden. A single `cloudflared` service handles all three hostnames through one `config.yml` with multiple `ingress` rules.
+**Isolating a bad/spiking site**: since everything is static, a traffic spike on one client just means more static file reads — Nginx handles this well natively. Add `limit_req_zone` keyed by `$host` so one hammered site can't starve the others:
+```nginx
+limit_req_zone $host zone=persite:10m rate=10r/s;
+```
+Apply `limit_req zone=persite burst=20 nodelay;` inside the location block. This caps any single domain's request rate without touching the others.
 
----
+## 3. DNS/domain flow
 
-## Setup Overview
+Two categories, handle them differently:
 
-1. Register/point each domain's nameservers at Cloudflare (free plan), added as separate zones for `.me` and `.tech`.
-2. Install `cloudflared`, authenticate with `cloudflared tunnel login`, create **one** tunnel and route DNS for each hostname to it.
-3. Write a single `config.yml` with an `ingress` rule per hostname → local port, copy it to `/etc/cloudflared/`, install as a systemd service.
-4. Set up each backend service:
-   - **Nginx** serving the portfolio's static files, root pointed at the site folder, correct permissions (`chmod 755`) on the home directory.
-   - **Filestash** in Docker, with *separate* host folders for its internal app state vs. actual served files (mounting both to the same folder pollutes the drive with Filestash's own state/config/db).
-   - **OnlyOffice Docs** in Docker for inline document preview inside Filestash, connected via WOPI.
-   - **Jellyfin** installed natively via its official install script, media library pointed at the movies folder.
-5. Lock down the private hostnames with **Cloudflare Access** (Zero Trust → Access → Applications → self-hosted app → policy allowing only your email), in addition to each app's own login.
+- **Demo sites** → `raunakkushwaha.me/demo/<slug>/` or `<slug>.raunakkushwaha.me` subdomain. Subdomain is better than subpath because it's a completely separate folder in your site-map and trivially "promotable" — same folder just gets a new domain pointed at it later, zero file restructuring.
+- **Client-owned domains** → client points their domain's DNS to Cloudflare (change nameservers, or if they don't want to move nameservers, a CNAME to your tunnel if using Cloudflare for SaaS / custom hostnames — worth looking into **Cloudflare for SaaS custom hostnames** once you're past ~20 clients, since it lets clients keep their own DNS provider and just add one CNAME, rather than requiring full nameserver migration to your Cloudflare account, which is a support burden at scale).
 
-Full command reference and config snippets live in the setup notes / `setup.sh` in this repo — update them if your ports, tunnel name, or paths differ.
+**Migration process (demo → live)**: since demo and live are just different site-map entries pointing at the same folder, "going live" is:
+1. Client buys domain / confirms they own one.
+2. You add their domain in Cloudflare (or they add the CNAME record if using SaaS custom hostnames).
+3. One line added to `site-map.conf`, reload nginx.
+4. Optionally symlink or copy the demo folder to a permanent client folder (recommend copy, not symlink — so you can delete demos in bulk later without breaking live sites).
 
----
+## 4. Scalability ceiling for the Pi 5
 
-## Key Lessons Learned
+Static file serving is extremely cheap — the Pi 5 (8GB, quad-core) can realistically serve **thousands of req/s** for small static sites before CPU becomes the bottleneck; you'll hit other limits first:
 
-- `sudo cloudflared service install` needs its config in `/etc/cloudflared/`, not `~/.cloudflared/` — root doesn't expand `~` to your user home. Edit the home directory copy, then `cp` it over and restart the service.
-- **cloudflared's `cert.pem` is zone-scoped.** `cloudflared tunnel login` authorizes your local cert for whichever Cloudflare zone you pick in the browser. Running `tunnel route dns` for a hostname in a *different* zone than the active cert doesn't fail loudly — it can silently create a malformed nested DNS record. If you manage multiple zones on one tunnel, keep the cert for each zone backed up separately and swap the correct one into place before routing DNS for that zone.
-- Running two separate `cloudflared` tunnels (one per domain) caused conflicts — consolidating to **one tunnel with multiple ingress rules** is simpler and avoids running two systemd services.
-- Docker volumes: don't mount the same host folder for an app's internal state *and* its user-facing file storage — use two separate folders.
-- Actively maintained tooling matters for anything internet-facing — a candidate that turned out to be archived with no further security fixes was dropped in favor of a maintained alternative.
-- When wiring two containers together (e.g. an office/document server and a file manager), check whether one side enforces a security feature (like JWT signing) the other side can't configure — you may need to explicitly disable it on one side rather than assume they'll "just work" together, and revisit that decision if the setup is ever exposed more broadly.
-- Nginx serving from a home directory requires `chmod 755` on the home folder itself, not just the project folder.
-- SCP destination needs a colon: `user@ip:/path/`, not `user@ip/path/`.
-- Two-layer auth (app login + Cloudflare Access) is worth the setup time for anything private-facing — Access blocks unauthorized traffic before it even reaches the Pi.
-- Always hard refresh (`Ctrl+Shift+R`) or use incognito when testing frontend/CSS changes.
+- **SD card I/O** is the real first bottleneck, not CPU — move `/srv/sites` to a USB 3 SSD, not the SD card, before you cross ~30-50 sites. This is cheap (a $15-20 USB SSD) and buys you a lot of headroom.
+- **cloudflared tunnel throughput**: one tunnel process handles this fine for hundreds of low-traffic sites; you won't hit this ceiling before others.
+- **Real ceiling**: not "sites" but **aggregate concurrent traffic**. 200 small local-business sites with modest traffic (a few hundred visits/day each) is trivial for a Pi 5 on an SSD. What kills it is a single client going viral (e.g., a restaurant's post blows up) — that's what the per-host rate limiting above protects against.
 
----
+**Concrete upgrade path when you do outgrow it:**
+1. First lever: SSD instead of SD card (do this immediately, it's near-zero cost).
+2. Second lever: move only the shared Node service (contact forms, multi-tenant DB) off the Pi onto a cheap VPS (~$5/mo), since that's the one stateful bottleneck — keep static sites on the Pi.
+3. Third lever, once you're comfortable charging for scale: put static sites on **Cloudflare Pages** (free tier, unlimited bandwidth, effectively infinite scale) instead of your Pi. Migration is trivial since sites are already static — `git push` or API upload per client folder. Keep the Pi for the dashboard/internal tools.
+4. You'll almost certainly move to lever 3 well before the Pi's CPU/RAM is the constraint — do it once client count or support burden of Pi uptime babysitting outweighs the "free hosting" pride. Around 100+ paying clients, an hour of your downtime costs more in reputation than $0/mo hosting saves.
 
-## Security Notes
+## 5. Reliability & ops
 
-- Private services (drive, movies) are meant to sit behind **both** their own login and a Cloudflare Access email allowlist. If you're replicating this setup, double-check the Access policy is actually saved with your email before treating a service as locked down — an unsaved/empty policy leaves it protected only by the app's own login.
-- Any internal-only service (e.g. a document server used solely by another container on the same host) should stay out of the tunnel's `ingress` list unless it specifically needs to be public.
-- Admin passwords, JWT secrets, and tunnel credential files are **not** included in this repo — generate your own strong secrets and keep them in a password manager, not in version control.
+- **Backups**: `/srv/sites` is just flat files — a nightly `rsync` or `tar` to a second location (external USB drive plugged into the Pi, *and* an offsite copy — Backblaze B2 or a free-tier cloud storage bucket, since "the only backup is on the device that might fail" isn't a backup). Cron job, few lines, non-negotiable before client #10.
+- **Uptime monitoring**: Cloudflare Tunnel doesn't tell you if Nginx itself crashed behind it — use an external check (UptimeRobot free tier, or a cheap cron+curl from a $5 VPS) hitting each live client domain every 5 min, alerting you via Telegram/email. Since 404 vs 530 vs timeout mean different things, have the checker actually verify body content, not just status code.
+- **Pi failure recovery**: keep a second SD card (or better, the SSD itself is your recovery — the Pi's OS partition should be a quick `dd` image you refresh weekly) so a hardware failure is "swap SD card into spare Pi" not "rebuild from scratch." Back up `~/.cloudflared/*.json` and `cert.pem` off-Pi — losing these means a lost tunnel and an hour of downtime for every client at once.
+- **Renewal reminders**: this is a dashboard feature (below), not a manual process past ~15 clients — you will forget, and a lapsed domain is customer churn plus reputational damage.
 
----
+## 6. Tooling to build
 
-## Current Status
+**Demo-site generator** (highest leverage single tool — directly cuts your ~1hr/demo cost, which is your main scaling bottleneck on the sales side):
+- Input: Google Maps Place ID or share link (name, address, hours, photos, phone), a menu/catalogue (photo or manual entry), theme choice (3-5 preset themes to start).
+- Build as a **template + data** system, not a drag-and-drop builder: one Handlebars/Nunjucks (or even just JS template literals) template per theme, a JSON schema for business data, a build script that renders template + data → static HTML into `/srv/sites/<slug>/`.
+- Google Places API can pull name/address/hours/photos directly given a place_id — this alone could take your 1-hour manual build down to 10-15 minutes (fetch data → pick theme → fill menu → render).
+- This is your single highest-ROI build item — it's the thing that lets you close more demos per week.
 
-- ✅ Portfolio (`raunakkushwaha.me`) — live
-- ✅ Private drive (`drive.raunakkushwaha.tech`) — live, file upload/download and document preview working
-- 🔄 Movie server (`movies.raunakkushwaha.tech`) — in progress (tunnel routing + Cloudflare Access being finalized)
+**Internal dashboard** (second priority):
+- SQLite-backed (no need for anything heavier at 200 clients), single Node/Express app on the Pi (or same shared multi-tenant service from above).
+- Tables: `clients` (name, contact, tier, domain, demo_slug), `payments` (amount, date, type: build/domain/hosting), `renewals` (due_date, type, status).
+- Views: renewal calendar (next 30/60/90 days), overdue payments, tier breakdown, MRR from hosting+domain fees.
+- This is what turns "renewal reminders" from a mental burden into a query.
 
-## What's Next
+## 7. Business-to-tech mapping
 
-- [ ] Finish Cloudflare Access lock-down on both private hostnames
-- [ ] Finish and verify movie server tunnel routing
-- [ ] Normalize all services to run in Docker for consistency
-- [ ] Add more pages to the portfolio (projects, about, gallery)
-- [ ] WireGuard VPN for remote SSH access
-- [ ] Automate the cert-swapping workaround for multi-zone DNS routing
+| Tier | Price | Technical effort | What's actually different |
+|---|---|---|---|
+| Starter | 3-5k NPR | ~15-30 min with generator | Single template, single page, no form (or a mailto: link) |
+| Mid | 7-9k NPR | +30-60 min | Extra static pages (menu detail, gallery), contact form → shared form endpoint |
+| Full Custom | 10-50k NPR | Days, real scoping needed | Multi-tenant DB features (reservations, inventory, ordering) — built on your **shared** multi-tenant service, not bespoke per client |
 
----
+**Highest-leverage upsell triggers**:
+- Starter → Mid: "Want a contact form so people can message you directly instead of just calling?" — cheap to deliver (shared endpoint), easy yes.
+- Mid → Full Custom: once a business has real repeat engagement (a restaurant wanting online ordering, a shop wanting inventory display) — this is where the recurring hosting fee should scale too (200 NPR/mo flat doesn't cover a DB-backed client; charge Full Custom clients more for hosting, e.g. 500-1000 NPR/mo, since they're consuming shared-service compute, not just a static folder).
 
-*Built and self-hosted by Raunak Kushwaha — [@wrdogamer4141](https://youtube.com/@wrdogamer4141)*
+## Prioritized feature list
+
+**Must-have for launch (0-20 sites, do manually where sensible):**
+- Static site template(s) for Starter/Mid (2-3 themes)
+- Nginx map-based multi-site routing (build this now, not at site #20 — retrofitting 20 hand-written server blocks later is wasted work)
+- Subdomain-based demo hosting
+- Basic backup cron (rsync to USB + one offsite copy)
+- Manual renewal tracking in a spreadsheet is fine here — don't build the dashboard yet
+
+**Phase 2 (20-100 sites):**
+- Demo-site generator (Google Places API + template render) — build this as soon as manual demo-building starts feeling like your bottleneck, likely around client #15-20
+- Internal dashboard (clients, tiers, renewals, payments)
+- Shared contact-form microservice
+- Uptime monitoring (external)
+- Per-host rate limiting in Nginx
+- Move `/srv/sites` to SSD if not done already
+
+**Phase 3 (100-200+):**
+- Cloudflare for SaaS custom hostnames (if client domain onboarding friction is a problem)
+- Shared multi-tenant DB service for Full Custom tier
+- Evaluate migrating static hosting to Cloudflare Pages (keep Pi for dashboard/tools only)
+- Formal offsite backup automation (not just cron+USB)
+- Consider a second person for demo generation/sales once tooling isn't the bottleneck but your time is
